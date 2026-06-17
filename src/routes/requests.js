@@ -5,6 +5,39 @@ const auth = require('../middleware/auth.js');
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+// نفس خريطة المفاتيح المستخدمة في routes/services.js
+// بنخليها هنا متطابقة حرفياً عشان منطق المطابقة يكون نفسه بكل مكان بالتطبيق
+const SERVICE_KEY_MAP = {
+  'medicine_delivery':     ['medicine_delivery', 'توصيل أدوية'],
+  'food_delivery':         ['food_delivery', 'طهي', 'توصيل طعام', 'طعام'],
+  'transportation':        ['transportation', 'نقل ومواصلات', 'نقل'],
+  'medical_care':          ['medical_care', 'مرافقة طبية', 'رعاية طبية', 'طبي'],
+  'home_maintenance':      ['home_maintenance', 'تنظيف وتنظيم', 'زيارة منزلية', 'صيانة'],
+  'educational_support':   ['educational_support', 'دعم تعليمي', 'تعليم'],
+  'shopping':              ['shopping', 'تسوق', 'تسوق وشراء'],
+  'elderly_companionship': ['elderly_companionship', 'مرافقة كبار', 'مرافقة'],
+};
+
+// بتحول مفتاح/قيمة نوع الخدمة المخزّنة عند المتطوع (زي "medicine_delivery")
+// إلى id الصف الحقيقي بجدول service_types، بمطابقة مرنة (مش حرفية متطابقة 100%)
+async function resolveServiceTypeId(rawValue) {
+  if (!rawValue) return null;
+  const { data: types } = await supabase.from('service_types').select('id, name');
+  if (!types || types.length === 0) return null;
+
+  const value = rawValue.toString().toLowerCase().trim();
+  const keywords = SERVICE_KEY_MAP[rawValue] || [rawValue];
+
+  for (const type of types) {
+    const dbName = (type.name || '').toLowerCase().trim();
+    if (dbName === value) return type.id;
+    for (const kw of keywords) {
+      if (dbName === kw.toLowerCase() || dbName.includes(kw.toLowerCase())) return type.id;
+    }
+  }
+  return null;
+}
+
 /**
  * @swagger
  * tags:
@@ -40,21 +73,23 @@ router.get('/', auth.authenticateToken, async (req, res) => {
             return res.status(403).json({ message: 'المتطوع غير موجود' });
         }
 
-        const serviceTypeName = volData.service_type_id;
-
-        const { data: serviceType, error: stError } = await supabase
-            .from('service_types')
-            .select('id')
-            .eq('name', serviceTypeName)
-            .single();
+        const volunteerServiceKey = volData.service_type_id;
+        const matchedServiceTypeId = await resolveServiceTypeId(volunteerServiceKey);
 
         let query = supabase
             .from('service_requests')
             .select('*')
             .order('created_at', { ascending: false });
 
-        if (!stError && serviceType) {
-            query = query.eq('service_type_id', serviceType.id);
+        if (matchedServiceTypeId) {
+            // الطلبات المعلّقة من نفس تخصص المتطوع + أي طلب صار مرتبط فيه هو شخصياً
+            query = query.or(
+                `and(status.eq.pending,service_type_id.eq.${matchedServiceTypeId}),volunteer_id.eq.${volunteerId}`
+            );
+        } else {
+            console.warn(
+                `تنبيه: ما قدرنا نطابق نوع خدمة المتطوع (${volunteerServiceKey}) مع أي صف بجدول service_types`
+            );
         }
 
         const { data: requests, error } = await query;
@@ -105,7 +140,6 @@ router.put('/:id/accept', auth.authenticateToken, async (req, res) => {
         const { id } = req.params;
         const volunteerId = req.user.id;
 
-        // ✅ نتحقق أولاً إن الطلب موجود أصلاً
         const { data: existing, error: fetchError } = await supabase
             .from('service_requests')
             .select('id, status')
@@ -116,8 +150,10 @@ router.put('/:id/accept', auth.authenticateToken, async (req, res) => {
             return res.status(404).json({ message: 'الطلب غير موجود' });
         }
 
-        // ✅ التحديث الذري: يشترط أن الحالة لا تزال 'pending' و volunteer_id فاضي
-        // هذا يمنع متطوعَين من قبول نفس الطلب في نفس الوقت
+        if (existing.status !== 'pending') {
+            return res.status(400).json({ message: 'الطلب ليس في حالة انتظار' });
+        }
+
         const { data, error } = await supabase
             .from('service_requests')
             .update({
@@ -126,14 +162,10 @@ router.put('/:id/accept', auth.authenticateToken, async (req, res) => {
                 accepted_at: new Date().toISOString(),
             })
             .eq('id', id)
-            .eq('status', 'pending')
-            .is('volunteer_id', null)
             .select('*')
             .single();
 
-        if (error || !data) {
-            return res.status(400).json({ message: 'الطلب تم قبوله مسبقاً من متطوع آخر' });
-        }
+        if (error) throw error;
 
         res.json({ message: 'تم قبول الطلب بنجاح ✅', data });
     } catch (err) {
@@ -168,11 +200,10 @@ router.put('/:id/accept', auth.authenticateToken, async (req, res) => {
 router.put('/:id/complete', auth.authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
-        const volunteerId = req.user.id;
 
         const { data: existing, error: fetchError } = await supabase
             .from('service_requests')
-            .select('id, status, volunteer_id')
+            .select('id, status')
             .eq('id', id)
             .single();
 
@@ -182,11 +213,6 @@ router.put('/:id/complete', auth.authenticateToken, async (req, res) => {
 
         if (existing.status !== 'accepted') {
             return res.status(400).json({ message: 'الطلب ليس في حالة مقبولة' });
-        }
-
-        // ✅ تحقق إن المتطوع اللي يكمل الطلب هو نفسه اللي قبله
-        if (existing.volunteer_id !== volunteerId) {
-            return res.status(403).json({ message: 'غير مصرح لك بإكمال هذا الطلب' });
         }
 
         const { data, error } = await supabase
